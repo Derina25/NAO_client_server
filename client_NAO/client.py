@@ -1,205 +1,183 @@
 # -*- coding: utf-8 -*-
-import qi  # Framework per interagire con il robot NAO
 import socket
 import struct
+import traceback
+import uuid
+
+from uuid import uuid4
 import numpy as np
 import cv2
 from PIL import Image
 import io
-import vision_definitions  # Definizioni specifiche per le videocamere di NAO
+import vision_definitions
 import time
+from naoqi import ALProxy
 
-# Configura l'indirizzo IP e la porta del robot NAO
-NAO_IP = "nao01.local"  # Sostituisci con l'IP reale del robot NAO
-NAO_PORT = 9559  # Porta predefinita per NAO
+NAO_IP = "169.254.248.149"
+NAO_PORT = 9559
+SERVER_IP = "127.0.0.1"
+SERVER_PORT = 8080
+SOCKET_TIMEOUT = 30
 
-# Configura il server a cui inviare i frame di NAO
-SERVER_IP = "0.0.0.0"  # Sostituisci con l'IP del server
-SERVER_PORT = 6000  # Porta predefinita per il server
-SOCKET_TIMEOUT = 30  # Timeout in secondi per le operazioni socket
-
+CAMERA_NAME = uuid.uuid4().hex
 
 def connect_to_nao():
     """
-    Si connette al robot NAO e al servizio video 'ALVideoDevice'.
-    Restituisce il video_client e il video_service.
+    Si connette al robot NAO e si iscrive al servizio video per acquisire immagini dalla telecamera.
+
+    Restituisce:
+        video_client: identificatore della sottoscrizione al servizio video.
+        video_service: oggetto proxy per il servizio video di NAO.
     """
+
     try:
-        # Avvia l'applicazione qi
-        app = qi.Application(["NAO_Client"])
-        app.start()
-
-        # Connettiti alla sessione di NAO
-        session = app.session
-        session.connect('tcp://' + NAO_IP + ':' + str(NAO_PORT))
-
-        # Ottieni il servizio video del robot
-        video_service = session.service('ALVideoDevice')
-        if not video_service:
-            print("Errore: Servizio ALVideoDevice non disponibile.")
-            return None, None
-
-        # Configurazione videocamera
-        resolution = vision_definitions.kQQVGA  # Risoluzione 160x120
-        color_space = vision_definitions.kRGBColorSpace  # Colori RGB
-        fps = 10  # Frame per secondo
-
-        # Iscrizione al servizio videocamera
-        video_client = video_service.subscribeCamera("python_GVM", 0, resolution, color_space, fps)
-        print("Connessione al robot NAO completata con successo.")
+        video_service = ALProxy("ALVideoDevice", NAO_IP, 9559)
+        resolution = vision_definitions.kVGA
+        color_space = vision_definitions.kRGBColorSpace
+        fps = 10
+        video_client = video_service.subscribeCamera(CAMERA_NAME, 0, resolution, color_space, fps)
         return video_client, video_service
-
-    except RuntimeError as e:
-        print("Errore nella connessione al robot NAO: {}".format(e))
+    except Exception as e:
+        print("Errore connessione NAO:", e)
         return None, None
-
 
 def get_nao_frame(video_client, video_service):
     """
-    Acquisisce un frame dalla videocamera del robot NAO.
-    Restituisce il frame come immagine OpenCV.
+    Acquisisce un frame dalla telecamera del NAO.
+
+    Parametri:
+        video_client: identificatore della sottoscrizione al servizio video.
+        video_service: oggetto proxy per il servizio video di NAO.
+
+    Restituisce:
+        frame (ndarray): immagine acquisita dalla telecamera, oppure None in caso di errore.
     """
     try:
-        # Ottiene l'immagine dalla videocamera
         nao_image = video_service.getImageRemote(video_client)
         if nao_image:
-            # Dimensioni dell'immagine
             width, height = nao_image[0], nao_image[1]
-
-            # Dati grezzi dell'immagine
             image_data = nao_image[6]
-
-            # Conversione in array numpy
             nparray = np.frombuffer(image_data, np.uint8).reshape((height, width, 3))
-
-            # In Python 2.7 non è necessario chiamare imdecode perché abbiamo già i dati raw
-            # Semplicemente organizziamo i dati in un formato BGR per OpenCV
-            frame = cv2.cvtColor(nparray, cv2.COLOR_RGB2BGR)
-
-            print("Frame acquisito dal robot NAO.")
-            return frame
+            return nparray
         else:
-            print("Errore: Nessun frame ricevuto dal robot.")
             return None
-    except Exception as e:
-        print("Errore durante l'acquisizione del frame da NAO: {}".format(e))
-        return None
-
+    except Exception:
+        traceback.print_exc()
 
 def send_frame_to_server(frame):
     """
-    Invia il frame acquisito al server tramite socket.
-    Restituisce la risposta del server.
+    Invia un frame al server per l'elaborazione e riceve la risposta.
+
+    Parametri:
+        frame (ndarray): immagine da inviare al server.
+
+    Restituisce:
+        response (str): risposta del server in formato JSON, oppure None in caso di errore.
     """
     try:
-        # Converti il frame da OpenCV (BGR) a PIL (RGB)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(frame_rgb)
-
-        # Usa un buffer per salvare il frame come immagine JPEG
         buffer = io.BytesIO()
         pil_image.save(buffer, format='JPEG')
         data = buffer.getvalue()
-        print("Immagine compressa: {} bytes".format(len(data)))
-
-        # Connettiti al server
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.settimeout(SOCKET_TIMEOUT)  # Imposta un timeout per evitare blocchi
+        client_socket.settimeout(SOCKET_TIMEOUT)
         client_socket.connect((SERVER_IP, SERVER_PORT))
-        print("Connesso al server {}:{}".format(SERVER_IP, SERVER_PORT))
-
-        # Invia la lunghezza dell'immagine
-        print("Invio dimensione dell'immagine: {} bytes".format(len(data)))
         client_socket.sendall(struct.pack("I", len(data)))
-
-        # Invia i dati dell'immagine
-        print("Invio dati dell'immagine...")
         client_socket.sendall(data)
-        print("Dati inviati. In attesa di risposta...")
-
-        # Ricevi la lunghezza della risposta
         resp_size_data = client_socket.recv(4)
         if not resp_size_data or len(resp_size_data) != 4:
-            print("Errore: Risposta dal server incompleta o mancante")
             client_socket.close()
             return None
-
         response_size = struct.unpack("I", resp_size_data)[0]
-        print("Dimensione risposta prevista: {} bytes".format(response_size))
-
-        # Ricevi la risposta completa
         response_data = b""
-        bytes_received = 0
-
-        while bytes_received < response_size:
-            chunk = client_socket.recv(min(4096, response_size - bytes_received))
+        while len(response_data) < response_size:
+            chunk = client_socket.recv(min(4096, response_size - len(response_data)))
             if not chunk:
                 break
             response_data += chunk
-            bytes_received += len(chunk)
-
         client_socket.close()
-
-        # In Python 2.7, le stringhe sono byte di default, quindi non serve decodificare
-        # Ma per chiarezza, convertiamo esplicitamente per garantire coerenza
-        response_str = response_data.decode('utf-8') if hasattr(response_data, 'decode') else response_data
-
-        print("Risposta ricevuta dal server: {}".format(response_str))
-        return response_str
-
-    except socket.timeout:
-        print("Timeout durante la comunicazione con il server")
+        return response_data.decode('utf-8')
+    except Exception:
         return None
+
+def nao_move_head(coordinates, video_service, img_width=None, img_height=None):
+    try:
+        motion = ALProxy("ALMotion", NAO_IP, NAO_PORT)
+
+        if img_width is None or img_height is None:
+            resolution = video_service.getParameter("current_resolution")
+            img_width = resolution[0]
+            img_height = resolution[1]
+
+        x1, y1, x2, y2 = coordinates
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+
+        norm_x = center_x / img_width
+        norm_y = center_y / img_height
+
+        yaw = (norm_x - 0.5) * 2
+        pitch = (0.5 - norm_y) * 2
+
+        max_yaw, max_pitch = 1.0, 0.5
+        yaw = max(-max_yaw, min(yaw, max_yaw))
+        pitch = max(-max_pitch, min(pitch, max_pitch))
+
+        motion.setAngles(["HeadYaw", "HeadPitch"], [yaw, pitch], 0.2)
     except Exception as e:
-        print("Errore nell'invio al server: {}".format(e))
-        return None
-
+        print(e)
 
 def main():
     """
-    Funzione principale del client.
-    Acquisisce i frame dalla videocamera di NAO e li invia al server.
+    Funzione principale: gestisce il ciclo di acquisizione immagini, invio al server, ricezione risposta e movimento della testa del NAO.
     """
-    video_client, video_service = connect_to_nao()
-    if not video_client or not video_service:
-        print("Errore: Impossibile connettersi al robot NAO. Esco...")
-        return
+    import json
 
+    video_client, video_service = connect_to_nao()
     try:
+        if not video_client or not video_service:
+            print("Errore: Impossibile connettersi al robot NAO.")
+            if not video_client:
+                print("Errore su video client")
+            if not video_service:
+                print("Errore su video service")
+            return
+        try:
+            resolution = video_service.getParameter("current_resolution")
+            img_width, img_height = resolution[0], resolution[1]
+        except Exception:
+            img_width, img_height = 160, 120
+
         while True:
-            # Acquisisci il frame dal robot NAO
+
             frame = get_nao_frame(video_client, video_service)
+
             if frame is None:
-                print("Errore nella cattura del frame. Riprovando...")
-                time.sleep(1)  # Breve pausa prima di riprovare
+                time.sleep(0.2)
                 continue
 
-            # Mostra il frame (opzionale)
-            cv2.imshow("Frame da NAO", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):  # Premi 'q' per uscire dal loop
-                break
-
-            # Invia il frame al server
-            print("Invio il frame al server...")
             server_response = send_frame_to_server(frame)
+
             if server_response:
-                print("Risultato dal server: {}".format(server_response))
-            else:
-                print("Errore: Nessuna risposta dal server.")
+                try:
+                    response_dict = json.loads(server_response)
+                    message = response_dict.get("message", "")
+                    coordinates = response_dict.get("coordinates", None)
+                    if "Cat detected" in message and coordinates and len(coordinates) == 4:
+                        nao_move_head(coordinates, video_service, img_width, img_height)
+                except Exception:
+                    pass
+            cv2.imshow("NAO - Tracciamento Gatto", frame)
 
-            # Breve pausa tra un invio e l'altro
-            time.sleep(0.5)
-
-    except KeyboardInterrupt:
-        print("\nInterruzione manuale ricevuta. Esco...")
-
-    finally:
-        # Rilascia risorse
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            time.sleep(0.1)
+    except Exception:
+        traceback.print_exc()
         if video_service and video_client:
             video_service.unsubscribe(video_client)
         cv2.destroyAllWindows()
-        print("Connessione al robot e alle risorse terminata.")
 
 
 if __name__ == "__main__":
